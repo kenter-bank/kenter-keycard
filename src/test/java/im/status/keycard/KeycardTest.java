@@ -11,9 +11,13 @@ import im.status.keycard.io.APDUCommand;
 import im.status.keycard.io.APDUResponse;
 import javacard.framework.AID;
 import org.bitcoinj.core.ECKey;
+import org.apache.commons.codec.binary.Base32;
 import org.bitcoinj.crypto.ChildNumber;
 import org.bitcoinj.crypto.DeterministicKey;
 import org.bitcoinj.crypto.HDKeyDerivation;
+import org.bitcoinj.crypto.MnemonicCode;
+import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters;
+import org.bouncycastle.crypto.signers.Ed25519Signer;
 import org.bouncycastle.jce.ECNamedCurveTable;
 import org.bouncycastle.jce.spec.ECParameterSpec;
 import org.bouncycastle.jce.spec.ECPublicKeySpec;
@@ -198,13 +202,10 @@ public class KeycardTest {
   }
 
   private static void initIfNeeded() throws Exception {
-    KeyPair identKeyPair = Certificate.generateIdentKeyPair();
-    Certificate cert = Certificate.createCertificate(caKeyPair, identKeyPair);
-    IdentCommandSet idCmdSet = new IdentCommandSet(sdkChannel);
-    idCmdSet.select().checkOK();
-    idCmdSet.storeData(cert.toStoreData()).checkOK();
+    // write-once: a card from an earlier run already holds a certificate from the same test CA
+    TestIdentity.provision(sdkChannel, caKeyPair);
 
-    KeycardCommandSet cmdSet = new KeycardCommandSet(sdkChannel, ((org.bouncycastle.jce.interfaces.ECPublicKey) caKeyPair.getPublic()).getQ().getEncoded(true));
+    KeycardCommandSet cmdSet = new KeycardCommandSet(sdkChannel,((org.bouncycastle.jce.interfaces.ECPublicKey) caKeyPair.getPublic()).getQ().getEncoded(true));
     cmdSet.select().checkOK();
 
     initCapabilities(cmdSet.getApplicationInfo());
@@ -239,6 +240,21 @@ public class KeycardTest {
     assertEquals(0x9000, response.getSw());
     byte[] data = response.getData();
     assertTrue(new ApplicationInfo(data).isInitializedCard());
+
+    // The Application Info Template (0xA4) length must exactly match its content so a strict
+    // BER-TLV parser does not truncate the trailing identity certificate (tag 0x8A), which the
+    // V2 secure channel needs. Guards the length computed in selectApplet().
+    assertEquals(KeycardApplet.TLV_APPLICATION_INFO_TEMPLATE, data[0]);
+    int declaredLen;
+    int contentStart;
+    if ((data[1] & 0xFF) == 0x81) {          // BER long-form (initialized card)
+      declaredLen = data[2] & 0xFF;
+      contentStart = 3;
+    } else {                                  // short-form (uninitialized card)
+      declaredLen = data[1] & 0xFF;
+      contentStart = 2;
+    }
+    assertEquals(data.length - contentStart, declaredLen, "A4 template length must equal its content length");
   }
 
   @Test
@@ -456,9 +472,90 @@ public class KeycardTest {
 
     resetAndSelectAndOpenSC();
 
-    // Unblock PIN to make further tests possible
-    response = cmdSet.unblockPIN("012345678901", "024680");
-    assertEquals(0x9000, response.getSw());
+    if (cmdSet.getApplicationInfo().hasFactoryResetCapability()) {
+      // Factory reset and re-init to start from a known, clean state. FACTORY RESET needs a verified PIN, so
+      // unblock (which also verifies the new PIN) first.
+      response = cmdSet.unblockPIN("012345678901", "000000");
+      assertEquals(0x9000, response.getSw());
+      response = cmdSet.factoryReset();
+      assertEquals(0x9000, response.getSw());
+      cmdSet.select().checkOK();
+      initCard(cmdSet);
+      cmdSet.autoOpenSecureChannel();
+
+      // Control, below the cumulative-wrong-attempt threshold: a wrong guess
+      // followed by the alt PIN leaves the main PIN usable.
+      response = cmdSet.verifyPIN("111111");
+      assertEquals(0x6300, response.getSw() & 0xFF00); // rejected
+      response = cmdSet.verifyPIN("024680");
+      assertEquals(0x9000, response.getSw());          // alt accepted
+      response = cmdSet.verifyPIN("000000");
+      assertEquals(0x9000, response.getSw());          // main still usable
+
+      // Attack: alternate wrong main guesses and alt-PIN resets.
+      response = cmdSet.verifyPIN("111111");
+      assertEquals(0x6300, response.getSw() & 0xFF00);
+      response = cmdSet.verifyPIN("024680");
+      assertEquals(0x9000, response.getSw());
+
+      response = cmdSet.verifyPIN("222222");
+      assertEquals(0x6300, response.getSw() & 0xFF00);
+      response = cmdSet.verifyPIN("024680");
+      assertEquals(0x9000, response.getSw());
+
+      response = cmdSet.verifyPIN("333333");
+      assertEquals(0x6300, response.getSw() & 0xFF00);
+      response = cmdSet.verifyPIN("024680");
+      assertEquals(0x9000, response.getSw());
+
+      response = cmdSet.verifyPIN("000000");
+      assertEquals(0x6300, response.getSw() & 0xFF00);
+
+      // Re-authenticate with the alt PIN so the PUK can be changed (the wrong
+      // attempt above cleared the validated flag).
+      response = cmdSet.verifyPIN("024680");
+      assertEquals(0x9000, response.getSw());
+
+      // The attacker swaps the PUK for one they know.
+      response = cmdSet.changePIN(KeycardApplet.CHANGE_PIN_P1_PUK, "210987654321");
+      assertEquals(0x9000, response.getSw());
+
+      // Block the active (alt) PIN so that UNBLOCK PIN is permitted.
+      response = cmdSet.verifyPIN("111111");
+      assertEquals(0x6300, response.getSw() & 0xFF00);
+      response = cmdSet.verifyPIN("222222");
+      assertEquals(0x6300, response.getSw() & 0xFF00);
+      response = cmdSet.verifyPIN("333333");
+      assertEquals(0x6300, response.getSw() & 0xFF00);
+
+      // Unblock with the attacker-known PUK. This resets the alt PIN only.
+      response = cmdSet.unblockPIN("210987654321", "135790");
+      assertEquals(0x9000, response.getSw());
+
+      // UNBLOCK PIN did NOT resetAndUnblock the main PIN: the correct main
+      // PIN is still rejected.
+      response = cmdSet.verifyPIN("000000");
+      assertEquals(0x6300, response.getSw() & 0xFF00);
+
+      response = cmdSet.verifyPIN("135790");
+      assertEquals(0x9000, response.getSw());
+      response = cmdSet.verifyPIN("000000");
+      assertEquals(0x6300, response.getSw() & 0xFF00);
+
+      // Leave the card in a clean, initialized state for subsequent tests (FACTORY RESET needs a verified PIN).
+      response = cmdSet.verifyPIN("135790");
+      assertEquals(0x9000, response.getSw());
+      response = cmdSet.factoryReset();
+      assertEquals(0x9000, response.getSw());
+      cmdSet.select().checkOK();
+      initCard(cmdSet);
+      cmdSet.autoOpenSecureChannel();
+    } else {
+      // Fallback (cards without the factory-reset capability): unblock the
+      // main PIN so subsequent tests (and tearDown) can proceed.
+      response = cmdSet.unblockPIN("012345678901", "000000");
+      assertEquals(0x9000, response.getSw());
+    }
   }
 
   @Test
@@ -787,7 +884,50 @@ public class KeycardTest {
     APDUResponse response = sdkChannel.send(new APDUCommand(0x80, KeycardApplet.INS_FACTORY_RESET, 0, 0, new byte[0]));
     assertEquals(0x6a86, response.getSw());
 
-    // Good case
+    // Initialized card with a key, PIN not verified: refused, and nothing is wiped
+    cmdSet.autoOpenSecureChannel();
+    assertEquals(0x9000, cmdSet.verifyPIN("000000").getSw());
+    assertEquals(0x9000, cmdSet.generateKey().getSw());
+    resetAndSelectAndOpenSC();
+    response = cmdSet.factoryReset();
+    assertEquals(0x6985, response.getSw());
+    assertTrue(cmdSet.getKeyInitializationStatus());
+
+    // A wrong PIN does not help
+    assertEquals(0x63c2, cmdSet.verifyPIN("999999").getSw());
+    assertEquals(0x6985, cmdSet.factoryReset().getSw());
+
+    // Duress (alt) PIN verified: allowed, so the duress PIN stays indistinguishable from the main PIN
+    assertEquals(0x9000, cmdSet.verifyPIN("024680").getSw());
+    response = cmdSet.factoryReset();
+    assertEquals(0x9000, response.getSw());
+
+    response = cmdSet.select();
+    assertEquals(0x9000, response.getSw());
+    assertFalse(cmdSet.getApplicationInfo().isInitializedCard());
+
+    // Not initialized: allowed (nothing to protect)
+    assertEquals(0x9000, cmdSet.factoryReset().getSw());
+    cmdSet.select().checkOK();
+
+    // PIN and PUK both blocked: the keys are already unusable, so a reset is allowed without a PIN
+    initCard(cmdSet);
+    cmdSet.autoOpenSecureChannel();
+    for (int i = 0; i < 3; i++) {
+      cmdSet.verifyPIN("999999");
+    }
+    assertEquals(0x6985, cmdSet.factoryReset().getSw()); // PUK still has tries left
+    for (int i = 0; i < 5; i++) {
+      cmdSet.unblockPIN("999999999999", "000000");
+    }
+    assertEquals(0x9000, cmdSet.factoryReset().getSw());
+    cmdSet.select().checkOK();
+    assertFalse(cmdSet.getApplicationInfo().isInitializedCard());
+
+    // Main PIN verified: allowed (the good case)
+    initCard(cmdSet);
+    cmdSet.autoOpenSecureChannel();
+    assertEquals(0x9000, cmdSet.verifyPIN("000000").getSw());
     response = cmdSet.factoryReset();
     assertEquals(0x9000, response.getSw());
 
@@ -875,6 +1015,28 @@ public class KeycardTest {
 
 
   @Test
+  @DisplayName("A new secure channel starts without the previous channel's PIN")
+  @Capabilities("keyManagement")
+  void newSecureChannelForgetsPin() throws Exception {
+    if (!cmdSet.getApplicationInfo().hasCredentialsManagementCapability()) {
+      return;
+    }
+    // GENERATE KEY needs only a verified PIN, so this does not depend on
+    // what an earlier test left on the card.
+    cmdSet.autoOpenSecureChannel();
+    assertEquals(0x9000, cmdSet.verifyPIN("000000").getSw());
+    assertEquals(0x9000, cmdSet.generateKey().getSw());
+
+    // No SELECT in between: only a fresh channel, as another process or
+    // reader would open. It must not inherit the holder's PIN.
+    cmdSet.autoOpenSecureChannel();
+    assertEquals(0x6985, cmdSet.generateKey().getSw());
+
+    assertEquals(0x9000, cmdSet.verifyPIN("000000").getSw());
+    assertEquals(0x9000, cmdSet.generateKey().getSw());
+  }
+
+  @Test
   @DisplayName("SIGN command")
   void signTest() throws Exception {
     byte[] data = "some data to be hashed".getBytes();
@@ -925,6 +1087,224 @@ public class KeycardTest {
 
     response = cmdSet.signWithPath(hash, derivedPath, false);
     verifySignResp(data, response);
+  }
+
+  @Test
+  @DisplayName("SIGN command with Ed25519")
+  void signEd25519Test() throws Exception {
+    byte[] data = "some data to be hashed".getBytes();
+    byte[] hash = sha256(data);
+    String path = "m/44'/148'/0'";
+
+    if (cmdSet.getApplicationInfo().hasSecureChannelCapability()) {
+      cmdSet.autoOpenSecureChannel();
+    }
+
+    if (cmdSet.getApplicationInfo().hasCredentialsManagementCapability()) {
+      APDUResponse pinResponse = cmdSet.verifyPIN("000000");
+      assertEquals(0x9000, pinResponse.getSw());
+    }
+
+    if (!cmdSet.getApplicationInfo().hasMasterKey()) {
+      APDUResponse genResponse = cmdSet.generateKey();
+      assertEquals(0x9000, genResponse.getSw());
+    }
+
+    APDUResponse response = cmdSet.signWithPath(hash, path, KeycardCommandSet.SIGN_P2_EDDSA_ED25519, false);
+    assertEquals(0x9000, response.getSw());
+    byte[] respData = response.getData();
+
+    byte[] pubKey = extractPublicKeyFromSignature(respData);
+    assertEquals(32, pubKey.length);
+
+    byte[] sigTlv = extractSignature(respData);
+    assertEquals((byte) 0x88, sigTlv[0]);
+    assertEquals((byte) 64, sigTlv[1]);
+    byte[] sig = Arrays.copyOfRange(sigTlv, 2, 66);
+
+    // RFC 8032 verification against the returned public key
+    Ed25519Signer verifier = new Ed25519Signer();
+    verifier.init(false, new Ed25519PublicKeyParameters(pubKey, 0));
+    verifier.update(hash, 0, hash.length);
+    assertTrue(verifier.verifySignature(sig), "Ed25519 signature must verify");
+
+    // pure Ed25519 is deterministic: same key, same message => same signature
+    APDUResponse response2 = cmdSet.signWithPath(hash, path, KeycardCommandSet.SIGN_P2_EDDSA_ED25519, false);
+    assertEquals(0x9000, response2.getSw());
+    assertArrayEquals(respData, response2.getData(), "Ed25519 signing must be deterministic");
+
+    // a different message must verify too (fresh nonce path)
+    byte[] hash2 = sha256("something else".getBytes());
+    response = cmdSet.signWithPath(hash2, path, KeycardCommandSet.SIGN_P2_EDDSA_ED25519, false);
+    assertEquals(0x9000, response.getSw());
+    assertArrayEquals(pubKey, extractPublicKeyFromSignature(response.getData()), "same path => same pubkey");
+    sig = Arrays.copyOfRange(extractSignature(response.getData()), 2, 66);
+    verifier = new Ed25519Signer();
+    verifier.init(false, new Ed25519PublicKeyParameters(pubKey, 0));
+    verifier.update(hash2, 0, hash2.length);
+    assertTrue(verifier.verifySignature(sig), "second Ed25519 signature must verify");
+
+    // ECDSA on the same derived path still works
+    response = cmdSet.signWithPath(hash, path, false);
+    verifySignResp(data, response);
+  }
+
+  @Test
+  @DisplayName("SLIP-0010 Ed25519 derivation matches SEP-0005 test vector")
+  void stellarSep0005Test() throws Exception {
+    // SEP-0005 test vector 1: 12-word mnemonic, primary account m/44'/148'/0'
+    String mnemonic = "illness spike retreat truth genius clock brain pass fit cave bargain toe";
+    String expectedAddress = "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6";
+    byte[] expectedPub = decodeStrkey(expectedAddress);
+
+    byte[] seed = MnemonicCode.toSeed(Arrays.asList(mnemonic.split(" ")), "");
+    byte[] stellarPath = {
+        (byte) 0x80, 0x00, 0x00, 0x2C, // 44'
+        (byte) 0x80, 0x00, 0x00, (byte) 0x94, // 148'
+        (byte) 0x80, 0x00, 0x00, 0x00  // 0'
+    };
+
+    if (cmdSet.getApplicationInfo().hasSecureChannelCapability()) {
+      cmdSet.autoOpenSecureChannel();
+    }
+
+    if (cmdSet.getApplicationInfo().hasCredentialsManagementCapability()) {
+      APDUResponse pinResponse = cmdSet.verifyPIN("000000");
+      assertEquals(0x9000, pinResponse.getSw());
+    }
+
+    APDUResponse response = cmdSet.loadKey(seed);
+    assertEquals(0x9000, response.getSw());
+
+    // EXPORT KEY with P2 = ED25519 public
+    response = cmdSet.exportKey(stellarPath, KeycardApplet.DERIVE_P1_SOURCE_MASTER, false, KeycardApplet.EXPORT_KEY_P2_ED25519_PUBLIC);
+    assertEquals(0x9000, response.getSw());
+    byte[] keyTemplate = response.getData();
+    assertEquals(KeycardApplet.TLV_KEY_TEMPLATE, keyTemplate[0]);
+    assertEquals(KeycardApplet.TLV_PUB_KEY, keyTemplate[2]);
+    assertEquals(32, keyTemplate[3]);
+    byte[] exportedPub = Arrays.copyOfRange(keyTemplate, 4, 36);
+    assertArrayEquals(expectedPub, exportedPub, "exported pubkey must match SEP-0005 G-address");
+
+    // SIGN with the same path must report the same pubkey and produce a valid signature
+    byte[] hash = sha256("stellar transaction signature payload".getBytes());
+    response = cmdSet.signWithPath(hash, "m/44'/148'/0'", KeycardCommandSet.SIGN_P2_EDDSA_ED25519, false);
+    assertEquals(0x9000, response.getSw());
+    byte[] signPub = extractPublicKeyFromSignature(response.getData());
+    assertArrayEquals(expectedPub, signPub, "SIGN pubkey must match SEP-0005 G-address");
+
+    byte[] sig = Arrays.copyOfRange(extractSignature(response.getData()), 2, 66);
+    Ed25519Signer verifier = new Ed25519Signer();
+    verifier.init(false, new Ed25519PublicKeyParameters(expectedPub, 0));
+    verifier.update(hash, 0, hash.length);
+    assertTrue(verifier.verifySignature(sig), "Ed25519 signature must verify against SEP-0005 key");
+
+    // non-hardened path elements are invalid for ed25519 (SW_DATA_INVALID, same as failed BIP32 derivation)
+    response = cmdSet.signWithPath(hash, "m/44'/148'/0", KeycardCommandSet.SIGN_P2_EDDSA_ED25519, false);
+    assertEquals(0x6984, response.getSw());
+  }
+
+  @Test
+  @DisplayName("the duress PIN derives a separate (decoy) set of Ed25519 keys; the main PIN still gets SEP-0005")
+  @Capabilities("credentialsManagement")
+  void ed25519DuressTreeTest() throws Exception {
+    String mnemonic = "illness spike retreat truth genius clock brain pass fit cave bargain toe";
+    byte[] expectedPub = decodeStrkey("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6");
+    byte[] seed = MnemonicCode.toSeed(Arrays.asList(mnemonic.split(" ")), "");
+    byte[] stellarPath = {(byte) 0x80, 0x00, 0x00, 0x2C, (byte) 0x80, 0x00, 0x00, (byte) 0x94, (byte) 0x80, 0x00, 0x00, 0x00};
+    byte[] hash = sha256("duress tree".getBytes());
+
+    cmdSet.autoOpenSecureChannel();
+    assertEquals(0x9000, cmdSet.verifyPIN("000000").getSw());
+    assertEquals(0x9000, cmdSet.loadKey(seed).getSw());
+    assertArrayEquals(expectedPub, exportEd25519(stellarPath));
+
+    // duress PIN: a different key at the same path, and SIGN agrees with EXPORT inside the decoy tree
+    assertEquals(0x9000, cmdSet.verifyPIN("024680").getSw());
+    byte[] decoyPub = exportEd25519(stellarPath);
+    assertFalse(Arrays.equals(expectedPub, decoyPub), "the duress PIN must not reach the real Ed25519 keys");
+    APDUResponse response = cmdSet.signWithPath(hash, "m/44'/148'/0'", KeycardCommandSet.SIGN_P2_EDDSA_ED25519, false);
+    assertEquals(0x9000, response.getSw());
+    assertArrayEquals(decoyPub, extractPublicKeyFromSignature(response.getData()));
+    Ed25519Signer verifier = new Ed25519Signer();
+    verifier.init(false, new Ed25519PublicKeyParameters(decoyPub, 0));
+    verifier.update(hash, 0, hash.length);
+    assertTrue(verifier.verifySignature(Arrays.copyOfRange(extractSignature(response.getData()), 2, 66)));
+
+    // the empty path would be the master key, the same in both trees: refused for both PINs
+    response = cmdSet.exportKey(new byte[0], KeycardApplet.DERIVE_P1_SOURCE_MASTER, false, KeycardApplet.EXPORT_KEY_P2_ED25519_PUBLIC);
+    assertEquals(0x6A80, response.getSw());
+    assertEquals(0x9000, cmdSet.verifyPIN("000000").getSw());
+    response = cmdSet.exportKey(new byte[0], KeycardApplet.DERIVE_P1_SOURCE_MASTER, false, KeycardApplet.EXPORT_KEY_P2_ED25519_PUBLIC);
+    assertEquals(0x6A80, response.getSw());
+
+    // back on the main PIN: the real key again
+    assertArrayEquals(expectedPub, exportEd25519(stellarPath));
+  }
+
+  @Test
+  @DisplayName("LOAD KEY with a 16- or 32-byte seed (e.g. a SLIP-39 master secret) gets the Ed25519 tree")
+  @Capabilities("credentialsManagement")
+  void ed25519ShortSeedTest() throws Exception {
+    cmdSet.autoOpenSecureChannel();
+    assertEquals(0x9000, cmdSet.verifyPIN("000000").getSw());
+
+    // SLIP-0010 test vector 1 (ed25519): seed 000102...0f, m/0' public key
+    byte[] vectorSeed = Hex.decode("000102030405060708090a0b0c0d0e0f");
+    assertEquals(0x9000, cmdSet.loadKey(vectorSeed).getSw());
+    assertArrayEquals(Hex.decode("8c8a13df77a28f3445213a0f432fde644acaa215fc72dcdf300d5efaa85d350c"),
+        exportEd25519(new byte[] {(byte) 0x80, 0x00, 0x00, 0x00}), "SLIP-0010 vector 1, m/0'");
+
+    // 16- and 32-byte seeds against an independent SLIP-0010 derivation, at a Stellar path
+    int[] path = {0x8000002C, 0x80000094, 0x80000003};
+    byte[] pathBytes = new byte[path.length * 4];
+    for (int i = 0; i < path.length; i++) {
+      pathBytes[i * 4] = (byte) (path[i] >> 24);
+      pathBytes[i * 4 + 1] = (byte) (path[i] >> 16);
+      pathBytes[i * 4 + 2] = (byte) (path[i] >> 8);
+      pathBytes[i * 4 + 3] = (byte) path[i];
+    }
+    for (int len : new int[] {16, 32}) {
+      byte[] seed = new byte[len];
+      new java.security.SecureRandom().nextBytes(seed);
+      assertEquals(0x9000, cmdSet.loadKey(seed).getSw());
+      assertArrayEquals(slip10Ed25519Public(seed, path), exportEd25519(pathBytes), len + "-byte seed");
+    }
+  }
+
+  /** SLIP-0010 ed25519, hardened only, computed with BouncyCastle (independent of the applet). */
+  private static byte[] slip10Ed25519Public(byte[] seed, int[] path) {
+    org.bouncycastle.crypto.macs.HMac hmac = new org.bouncycastle.crypto.macs.HMac(new org.bouncycastle.crypto.digests.SHA512Digest());
+    byte[] i = new byte[64];
+    hmac.init(new org.bouncycastle.crypto.params.KeyParameter("ed25519 seed".getBytes(java.nio.charset.StandardCharsets.US_ASCII)));
+    hmac.update(seed, 0, seed.length);
+    hmac.doFinal(i, 0);
+    for (int index : path) {
+      byte[] data = new byte[37];
+      System.arraycopy(i, 0, data, 1, 32);
+      data[33] = (byte) (index >> 24);
+      data[34] = (byte) (index >> 16);
+      data[35] = (byte) (index >> 8);
+      data[36] = (byte) index;
+      hmac.init(new org.bouncycastle.crypto.params.KeyParameter(Arrays.copyOfRange(i, 32, 64)));
+      hmac.update(data, 0, data.length);
+      hmac.doFinal(i, 0);
+    }
+    return new org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(i, 0).generatePublicKey().getEncoded();
+  }
+
+  private byte[] exportEd25519(byte[] path) throws Exception {
+    APDUResponse response = cmdSet.exportKey(path, KeycardApplet.DERIVE_P1_SOURCE_MASTER, false, KeycardApplet.EXPORT_KEY_P2_ED25519_PUBLIC);
+    assertEquals(0x9000, response.getSw());
+    return Arrays.copyOfRange(response.getData(), 4, 36);
+  }
+
+  private byte[] decodeStrkey(String address) {
+    byte[] raw = new Base32().decode(address);
+    // version byte (1) || ed25519 public key (32) || CRC16 (2)
+    assertEquals(35, raw.length);
+    assertEquals((byte) (6 << 3), raw[0]);
+    return Arrays.copyOfRange(raw, 1, 33);
   }
 
   private void verifySchnorrSignResp(byte[] data, APDUResponse response) throws Exception {
@@ -1074,7 +1454,156 @@ public class KeycardTest {
     response = cmdSet.exportBIP85(64, new KeyPath("m/83696968'/0'/0'").getData());
     assertEquals(0x9000, response.getSw());
     assertArrayEquals(expectedData, response.getData());
-  }  
+  }
+
+  // Published BIP85 master key (bip-0085.mediawiki, "Test vectors"), decoded here rather than transcribed.
+  static final String BIP85_XPRV = "xprv9s21ZrQH143K2LBWUUQRFXhucrQqBpKdRRxNVq2zBqsx8HVqFk2uYo8kmbaLLHRdqtQpUm98uKfu3vca1LqdGhUtyoFnCNkfmXRyPXLjbKb";
+
+  /**
+   * Independent BIP85: BIP32 derivation by bitcoinj, then HMAC-SHA512("bip-entropy-from-k", k) by
+   * BouncyCastle, truncated to len bytes. Shares no code with the applet.
+   */
+  static DeterministicKey bip32Derive(DeterministicKey master, String path) {
+    DeterministicKey k = master;
+    for (String c : path.substring(2).split("/")) {
+      boolean hardened = c.endsWith("'");
+      long idx = Long.parseLong(hardened ? c.substring(0, c.length() - 1) : c);
+      k = HDKeyDerivation.deriveChildKey(k, new ChildNumber((int) idx, hardened));
+    }
+    return k;
+  }
+
+  static byte[] bip85Reference(DeterministicKey master, String path, int len) {
+    DeterministicKey k = bip32Derive(master, path);
+    org.bouncycastle.crypto.macs.HMac hmac = new org.bouncycastle.crypto.macs.HMac(new org.bouncycastle.crypto.digests.SHA512Digest());
+    hmac.init(new org.bouncycastle.crypto.params.KeyParameter("bip-entropy-from-k".getBytes(java.nio.charset.StandardCharsets.US_ASCII)));
+    byte[] priv = k.getPrivKeyBytes();
+    hmac.update(priv, 0, priv.length);
+    byte[] out = new byte[64];
+    hmac.doFinal(out, 0);
+    return Arrays.copyOf(out, len);
+  }
+
+  static DeterministicKey bip85Master() {
+    return DeterministicKey.deserializeB58(null, BIP85_XPRV, org.bitcoinj.params.MainNetParams.get());
+  }
+
+  void loadBip85Master(DeterministicKey master) throws Exception {
+    cmdSet.autoOpenSecureChannel();
+    assertEquals(0x9000, cmdSet.verifyPIN("000000").getSw());
+    assertEquals(0x9000, cmdSet.loadKey(new BIP32KeyPair(master.getPrivKeyBytes(), master.getChainCode(), null)).getSw());
+  }
+
+  byte[] cardBip85(String path, int len) throws Exception {
+    APDUResponse response = cmdSet.exportBIP85(len, new KeyPath(path).getData());
+    assertEquals(0x9000, response.getSw(), path + " len " + len);
+    return response.getData();
+  }
+
+  @Test
+  @DisplayName("BIP85 published vectors: both raw cases and the 12/18/24-word BIP39 application, to the word")
+  void bip85PublishedVectorsTest() throws Exception {
+    DeterministicKey master = bip85Master();
+
+    // The reference implementation must reproduce the published derived keys before it is trusted
+    assertEquals("cca20ccb0e9a90feb0912870c3323b24874b0ca3d8018c4b96d0b97c0e82ded0",
+        Hex.toHexString(bip32Derive(master, "m/83696968'/0'/0'").getPrivKeyBytes()));
+    assertEquals("503776919131758bb7de7beb6c0ae24894f4ec042c26032890c29359216e21ba",
+        Hex.toHexString(bip32Derive(master, "m/83696968'/0'/1'").getPrivKeyBytes()));
+
+    loadBip85Master(master);
+
+    String[][] raw = {
+        {"m/83696968'/0'/0'", "efecfbccffea313214232d29e71563d941229afb4338c21f9517c41aaa0d16f00b83d2a09ef747e7a64e8e2bd5a14869e693da66ce94ac2da570ab7ee48618f7"},
+        {"m/83696968'/0'/1'", "70c6e3e8ebee8dc4c0dbba66076819bb8c09672527c4277ca8729532ad711872218f826919f6b67218adde99018a6df9095ab2b58d803b5b93ec9802085a690e"}};
+    for (String[] v : raw) {
+      assertEquals(v[1], Hex.toHexString(cardBip85(v[0], 64)), v[0]);
+      assertEquals(v[1], Hex.toHexString(bip85Reference(master, v[0], 64)), "reference " + v[0]);
+    }
+
+    // BIP39 application, English (language 0'): entropy truncated to 16/24/32 bytes
+    String[][] bip39 = {
+        {"12", "6250b68daf746d12a24d58b4787a714b", "girl mad pet galaxy egg matter matrix prison refuse sense ordinary nose"},
+        {"18", "938033ed8b12698449d4bbca3c853c66b293ea1b1ce9d9dc", "near account window bike charge season chef number sketch tomorrow excuse sniff circle vital hockey outdoor supply token"},
+        {"24", "ae131e2312cdc61331542efe0d1077bac5ea803adf24b313a4f0e48e9c51f37f", "puppy ocean match cereal symbol another shed magic wrap hammer bulb intact gadget divorce twin tonight reason outdoor destroy simple truth cigar social volcano"}};
+    for (String[] v : bip39) {
+      String path = "m/83696968'/39'/0'/" + v[0] + "'/0'";
+      int len = Integer.parseInt(v[0]) * 4 / 3;
+      byte[] entropy = cardBip85(path, len);
+      assertEquals(v[1], Hex.toHexString(entropy), path);
+      assertEquals(v[2], String.join(" ", MnemonicCode.INSTANCE.toMnemonic(entropy)), path + " mnemonic");
+    }
+  }
+
+  @Test
+  @DisplayName("BIP85 card vs independent reference: many paths, indexes, depths and every output length")
+  void bip85CrossCheckTest() throws Exception {
+    DeterministicKey master = bip85Master();
+    loadBip85Master(master);
+
+    java.util.List<String[]> cases = new java.util.ArrayList<>();
+    for (String words : new String[] {"12", "18", "24"}) {
+      for (String index : new String[] {"0", "1", "2", "1000", "2147483647"}) {
+        cases.add(new String[] {"m/83696968'/39'/0'/" + words + "'/" + index + "'", Integer.toString(Integer.parseInt(words) * 4 / 3)});
+      }
+    }
+    cases.add(new String[] {"m/83696968'/39'/1'/12'/0'", "16"});          // non-English language code
+    cases.add(new String[] {"m/83696968'/2'/0'", "32"});                  // WIF
+    cases.add(new String[] {"m/83696968'/32'/0'", "64"});                 // XPRV
+    for (String bytes : new String[] {"16", "32", "64"}) {
+      cases.add(new String[] {"m/83696968'/128169'/" + bytes + "'/0'", bytes}); // HEX
+    }
+    cases.add(new String[] {"m/83696968'/1'/2'/3'/4'/5'/6'/7'/8'/9'", "64"}); // maximum depth (10)
+
+    for (String[] c : cases) {
+      int len = Integer.parseInt(c[1]);
+      assertArrayEquals(bip85Reference(master, c[0], len), cardBip85(c[0], len), c[0]);
+    }
+
+    // Truncation keeps the leading bytes, for every allowed length
+    byte[] full = bip85Reference(master, "m/83696968'/0'/0'", 64);
+    for (int len = 1; len <= 64; len++) {
+      assertArrayEquals(Arrays.copyOf(full, len), cardBip85("m/83696968'/0'/0'", len), "len " + len);
+    }
+  }
+
+  @Test
+  @DisplayName("BIP85 from a seed loaded with LOAD KEY P1=SEED matches the reference (the production path)")
+  void bip85FromSeedTest() throws Exception {
+    // A BIP85-derived phrase used as a root, as the recovery flow would
+    String phrase = "girl mad pet galaxy egg matter matrix prison refuse sense ordinary nose";
+    byte[] seed = MnemonicCode.toSeed(Arrays.asList(phrase.split(" ")), "");
+    DeterministicKey master = HDKeyDerivation.createMasterPrivateKey(seed);
+
+    cmdSet.autoOpenSecureChannel();
+    assertEquals(0x9000, cmdSet.verifyPIN("000000").getSw());
+    assertEquals(0x9000, cmdSet.loadKey(seed).getSw());
+
+    for (String path : new String[] {"m/83696968'/39'/0'/12'/0'", "m/83696968'/39'/0'/24'/3'", "m/83696968'/0'/0'"}) {
+      int len = path.contains("/12'/") ? 16 : path.contains("/24'/") ? 32 : 64;
+      assertArrayEquals(bip85Reference(master, path, len), cardBip85(path, len), path);
+    }
+  }
+
+  @Test
+  @DisplayName("BIP85 rejects non-hardened components, foreign roots, too-deep paths and bad lengths")
+  void bip85RejectsTest() throws Exception {
+    loadBip85Master(bip85Master());
+
+    assertEquals(0x6a80, cmdSet.exportBIP85(16, new KeyPath("m/83696968'/39'/0'/12'/0").getData()).getSw());
+    assertEquals(0x6a80, cmdSet.exportBIP85(16, new KeyPath("m/83696968'/39/0'/12'/0'").getData()).getSw());
+    assertEquals(0x6a80, cmdSet.exportBIP85(16, new KeyPath("m/44'/39'/0'/12'/0'").getData()).getSw());
+    assertEquals(0x6a80, cmdSet.exportBIP85(16, new KeyPath("m/83696968'").getData()).getSw());
+    // 11 hardened components, one past KEY_PATH_MAX_DEPTH; built by hand because KeyPath refuses it
+    ByteBuffer tooDeep = ByteBuffer.allocate(11 * 4);
+    tooDeep.putInt(0x80000000 | 83696968);
+    for (int i = 1; i <= 10; i++) {
+      tooDeep.putInt(0x80000000 | i);
+    }
+    assertNotEquals(0x9000, cmdSet.exportBIP85(64, tooDeep.array()).getSw());
+    assertEquals(0x6a86, cmdSet.exportBIP85(0, new KeyPath("m/83696968'/0'/0'").getData()).getSw());
+    assertEquals(0x6a86, cmdSet.exportBIP85(65, new KeyPath("m/83696968'/0'/0'").getData()).getSw());
+  }
 
   @Test
   @DisplayName("STORE/GET DATA")
